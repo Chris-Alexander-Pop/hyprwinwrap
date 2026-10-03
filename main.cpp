@@ -29,6 +29,8 @@
 #include <hyprland/src/managers/SessionLockManager.hpp>
 #include <hyprland/src/config/values/ConfigValues.hpp>
 #include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
+#include <hyprland/src/desktop/view/window/WindowMetadata.hpp>
+#include <hyprland/src/config/shared/actions/ConfigActions.hpp>
 #include "globals.hpp"
 
 extern "C"
@@ -47,7 +49,7 @@ APICALL EXPORT std::string PLUGIN_API_VERSION()
 inline CFunctionHook *subsurfaceHook = nullptr;
 inline CFunctionHook *commitHook = nullptr;
 typedef void (*origCommitSubsurface)(Desktop::View::CSubsurface *thisptr);
-typedef void (*origCommit)(void *owner, void *data);
+typedef void (*origCommit)(Desktop::View::CWindow *thisptr, bool initialCommit);
 
 // bg window object
 struct SBgWindowSpec
@@ -63,9 +65,15 @@ std::vector<SP<Desktop::Rule::IRule>> bgRules;
 std::unordered_map<PHLWINDOW, bool> interactableStates;
 bool anyInteractive = false;
 
-// Specs registered via the Lua window() function during config evaluation.
+// Specs from window() while the config file is being evaluated. preReload clears
+// these so the next reload can rebuild them from the file.
 static std::vector<SBgWindowSpec> gLuaSpecs;
-// Legacy + Lua specs merged into one list, rebuilt on each config reload.
+// Specs from a live window() eval. Kept until a later live call replaces the
+// same class and title. A config reload does not drop these.
+static std::vector<SBgWindowSpec> gLiveLuaSpecs;
+// Set for the span between config.preReload and config.reloaded.
+static bool gCollectingConfigSpecs = false;
+// Legacy + Lua specs merged into one list, rebuilt when specs change.
 static std::vector<SBgWindowSpec> gMergedSpecs;
 // Geometry of each matched background window, so it can be re-applied later.
 static std::unordered_map<PHLWINDOW, SBgWindowSpec> gWindowSpecs;
@@ -137,8 +145,35 @@ static std::vector<SBgWindowSpec> collectSpecs()
         specs.push_back(legacy);
     }
 
+    // Live specs first so a live call overrides a config spec with the same match.
+    specs.insert(specs.end(), gLiveLuaSpecs.begin(), gLiveLuaSpecs.end());
     specs.insert(specs.end(), gLuaSpecs.begin(), gLuaSpecs.end());
     return specs;
+}
+
+static void rebuildBgRules();
+
+static bool isTrackedBgWindow(PHLWINDOW pWindow)
+{
+    for (const auto &ref : bgWindows)
+    {
+        if (ref.lock() == pWindow)
+            return true;
+    }
+    return false;
+}
+
+static void upsertLiveSpec(const SBgWindowSpec &spec)
+{
+    for (auto &existing : gLiveLuaSpecs)
+    {
+        if (existing.className == spec.className && existing.title == spec.title)
+        {
+            existing = spec;
+            return;
+        }
+    }
+    gLiveLuaSpecs.push_back(spec);
 }
 
 static void applyBgWindowGeometry(PHLWINDOW pWindow)
@@ -182,8 +217,8 @@ void onNewWindow(PHLWINDOW pWindow)
     const SBgWindowSpec *matched = nullptr;
     for (const auto &spec : gMergedSpecs)
     {
-        const bool classMatches = !spec.className.empty() && pWindow->m_initialClass == spec.className;
-        const bool titleMatches = !spec.title.empty() && pWindow->m_title == spec.title;
+        const bool classMatches = !spec.className.empty() && pWindow->metadata().appID() == spec.className;
+        const bool titleMatches = !spec.title.empty() && pWindow->metadata().title() == spec.title;
         if (classMatches || titleMatches)
         {
             matched = &spec;
@@ -200,16 +235,18 @@ void onNewWindow(PHLWINDOW pWindow)
 
     gWindowSpecs[pWindow] = *matched;
 
-    auto target = pWindow->layoutTarget();
-    if (!target->floating())
+    if (isTrackedBgWindow(pWindow))
     {
-        target->setFloating(true);
-        pWindow->m_isFloating = true;
+        applyBgWindowGeometry(pWindow);
+        return;
     }
+
+    if (!pWindow->isFloating())
+        Config::Actions::floatWindow(Config::Actions::TOGGLE_ACTION_ENABLE, pWindow);
 
     applyBgWindowGeometry(pWindow);
 
-    pWindow->m_pinned = true;
+    Config::Actions::pinWindow(Config::Actions::TOGGLE_ACTION_ENABLE, pWindow);
 
     interactableStates[pWindow] = false;
 
@@ -310,21 +347,21 @@ void onCommitSubsurface(Desktop::View::CSubsurface *thisptr)
     PWINDOW->m_hidden = !interactable;
 }
 
-void onCommit(void *owner, void *data)
+void onCommit(Desktop::View::CWindow *thisptr, bool initialCommit)
 {
-    const auto PWINDOW = ((Desktop::View::CWindow *)owner)->m_self.lock();
+    const auto PWINDOW = thisptr->m_self.lock();
 
     if (std::find_if(bgWindows.begin(), bgWindows.end(), [PWINDOW](const auto &ref)
                      { return ref.lock() == PWINDOW; }) == bgWindows.end())
     {
-        ((origCommit)commitHook->m_original)(owner, data);
+        ((origCommit)commitHook->m_original)(thisptr, initialCommit);
         return;
     }
 
     // cant use setHidden cuz that sends suspended and stuff that would be laggy
     PWINDOW->m_hidden = false;
 
-    ((origCommit)commitHook->m_original)(owner, data);
+    ((origCommit)commitHook->m_original)(thisptr, initialCommit);
     g_pHyprRenderer->damageWindow(PWINDOW);
 
     const bool interactable = interactableStates.contains(PWINDOW) ? interactableStates[PWINDOW] : false;
@@ -416,7 +453,12 @@ static int luaWindow(lua_State *L)
     if (s.className.empty() && s.title.empty())
         return luaL_error(L, "hyprwinwrap.window: requires a 'class' or 'title' field");
 
-    gLuaSpecs.push_back(s);
+    if (gCollectingConfigSpecs)
+        gLuaSpecs.push_back(s);
+    else
+        upsertLiveSpec(s);
+
+    rebuildBgRules();
     return 0;
 }
 
@@ -448,27 +490,31 @@ static int luaFocus(lua_State *L)
 {
     const std::string match = luaL_checkstring(L, 1);
 
-    // First pass class, then title; toggle whichever matches
-    for (const auto prop : {&Desktop::View::CWindow::m_initialClass, &Desktop::View::CWindow::m_title})
+    // First pass class (app id), then title; toggle whichever matches
+    const auto tryMatch = [&](const auto &getter)
     {
         int toggled = 0;
         for (auto &bg : bgWindows)
         {
             const auto bgw = bg.lock();
-            if (bgw && bgw.get()->*prop == match)
+            if (bgw && getter(*bgw) == match)
             {
                 toggleBgWindow(bgw);
                 toggled++;
             }
         }
-        if (toggled > 0)
-            return 0;
-    }
+        return toggled;
+    };
+
+    if (tryMatch([](Desktop::View::CWindow &w) { return w.metadata().appID(); }) > 0)
+        return 0;
+    if (tryMatch([](Desktop::View::CWindow &w) { return w.metadata().title(); }) > 0)
+        return 0;
 
     return luaL_error(L, "hyprwinwrap.focus: no background window matching '%s'", match.c_str());
 }
 
-void onConfigReloaded()
+static void rebuildBgRules()
 {
     clearWindowRules();
 
@@ -493,6 +539,17 @@ void onConfigReloaded()
     }
 
     Desktop::Rule::ruleEngine()->updateAllRules();
+
+    // Copy first: onNewWindow can reorder the compositor window list.
+    const auto openWindows = Desktop::windowState()->windows();
+    for (const auto &w : openWindows)
+        onNewWindow(w);
+}
+
+void onConfigReloaded()
+{
+    gCollectingConfigSpecs = false;
+    rebuildBgRules();
 }
 
 APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle)
@@ -517,9 +574,11 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle)
                                                                 { onRenderStage(stage); });
     static auto P4 = Event::bus()->m_events.config.reloaded.listen([&]
                                                                    { onConfigReloaded(); });
-    // rebuilt each reload; clear before the config is evaluated.
-    static auto P4b = Event::bus()->m_events.config.preReload.listen([&]
-                                                                     { gLuaSpecs.clear(); });
+    // Config-file specs are rebuilt from the file. Live specs stay.
+    static auto P4b = Event::bus()->m_events.config.preReload.listen([&] {
+        gCollectingConfigSpecs = true;
+        gLuaSpecs.clear();
+    });
 
     // Workspace changes can re-apply gap and border settings, shifting the window slightly
     static auto P5 = Event::bus()->m_events.workspace.active.listen([&](PHLWORKSPACE ws)
@@ -561,7 +620,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle)
         throw std::runtime_error("hyprwinwrap: onCommit not found");
     subsurfaceHook = HyprlandAPI::createFunctionHook(PHANDLE, fns[0].address, (void *)&onCommitSubsurface);
 
-    fns = HyprlandAPI::findFunctionsByName(PHANDLE, "_ZN7Desktop4View7CWindow12commitWindowEv");
+    fns = HyprlandAPI::findFunctionsByName(PHANDLE, "_ZN7Desktop4View7CWindow12commitWindowEb");
     if (fns.size() < 1)
         throw std::runtime_error("hyprwinwrap: listener_commitWindow not found");
     commitHook = HyprlandAPI::createFunctionHook(PHANDLE, fns[0].address, (void *)&onCommit);
